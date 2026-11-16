@@ -1,0 +1,182 @@
+"""Results module for StreetRace Manager: race outcomes, points and prize money."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from .inventory import InventoryModule
+from .race_management import RaceManagementModule
+from .registration import RegistrationModule
+
+
+@dataclass(frozen=True)
+class RaceResult:
+    """The recorded outcome of a completed race."""
+
+    race_id: str
+    driver_name: str
+    car_id: str
+    position: int
+    points_awarded: int
+    prize_money: float
+    car_damaged: bool
+
+
+class ResultsError(ValueError):
+    """Raised when a results operation is invalid."""
+
+
+class ResultsModule:
+    """Records race results and keeps a points table.
+
+    Points: 1st = 10, 2nd = 6, 3rd = 4, any other finish = 1.
+    """
+
+    def __init__(
+        self,
+        registration: RegistrationModule,
+        race_management: RaceManagementModule,
+        inventory: InventoryModule,
+    ) -> None:
+        self._registration = registration
+        self._race_management = race_management
+        self._inventory = inventory
+        self._results: dict[str, RaceResult] = {}
+        self._rankings: dict[str, int] = {}
+        self._display_names: dict[str, str] = {}
+
+    def record_result(self, race_id: str, position: int, prize_money: float, car_damaged: bool = False) -> RaceResult:
+        """Record the result of a completed race.
+
+        Awards points to the driver, adds prize money to the cash balance and
+        marks the car damaged if requested.
+
+        Args:
+            race_id: A completed race.
+            position: Finishing position (1 = winner).
+            prize_money: Non-negative prize amount.
+            car_damaged: Whether the car was damaged in the race.
+
+        Raises:
+            ResultsError: If the input is invalid, the race is not completed, the
+                driver is no longer registered or a result already exists.
+        """
+        cleaned_race_id = race_id.strip() if isinstance(race_id, str) else ""
+        if not cleaned_race_id:
+            raise ResultsError("Race ID is required.")
+        if not isinstance(position, int) or position <= 0:
+            raise ResultsError("Position must be a positive integer.")
+        if not isinstance(prize_money, (int, float)) or prize_money < 0:
+            raise ResultsError("Prize money must be a non-negative number.")
+        if not isinstance(car_damaged, bool):
+            raise ResultsError("Car damaged flag must be a boolean.")
+
+        race_key = cleaned_race_id.casefold()
+        if race_key in self._results:
+            raise ResultsError(f"Result for race '{cleaned_race_id}' is already recorded.")
+
+        race = self._race_management.get_race(cleaned_race_id)
+        if race.status != "completed":
+            raise ResultsError(f"Race '{race.race_id}' is not completed.")
+        if not self._registration.is_registered(race.driver_name):
+            raise ResultsError(f"Crew member '{race.driver_name}' is not registered.")
+
+        points = self._calculate_points(position)
+
+        if prize_money > 0:
+            self._inventory.add_cash(float(prize_money))
+        if car_damaged:
+            self._inventory.set_car_status(race.car_id, "damaged")
+
+        driver_key = race.driver_name.casefold()
+        self._rankings[driver_key] = self._rankings.get(driver_key, 0) + points
+        self._display_names[driver_key] = race.driver_name
+
+        result = RaceResult(
+            race_id=race.race_id,
+            driver_name=race.driver_name,
+            car_id=race.car_id,
+            position=position,
+            points_awarded=points,
+            prize_money=float(prize_money),
+            car_damaged=car_damaged,
+        )
+        self._results[race_key] = result
+        return result
+
+    def remove_result(self, race_id: str) -> RaceResult:
+        """Remove a recorded result and undo its effect on points, cash and car status."""
+        key = self._normalize_race_key(race_id)
+        result = self._results.get(key)
+        if result is None:
+            raise ResultsError(f"Result for race '{race_id.strip()}' does not exist.")
+
+        driver_key = result.driver_name.casefold()
+        updated_points = self._rankings.get(driver_key, 0) - result.points_awarded
+        if updated_points > 0:
+            self._rankings[driver_key] = updated_points
+        else:
+            self._rankings.pop(driver_key, None)
+            self._display_names.pop(driver_key, None)
+
+        if result.prize_money > 0:
+            self._inventory.spend_cash(result.prize_money)
+
+        if result.car_damaged:
+            car = self._inventory.get_car(result.car_id)
+            if car.status == "damaged":
+                self._inventory.set_car_status(result.car_id, "maintenance")
+                self._inventory.set_car_status(result.car_id, "ready")
+
+        del self._results[key]
+        return result
+
+    def get_result(self, race_id: str) -> RaceResult:
+        """Return the result for a race.
+
+        Raises:
+            ResultsError: If no result is recorded.
+        """
+        key = self._normalize_race_key(race_id)
+        result = self._results.get(key)
+        if result is None:
+            raise ResultsError(f"Result for race '{race_id.strip()}' does not exist.")
+        return result
+
+    def get_driver_points(self, member_name: str) -> int:
+        """Return a registered driver's total points (0 if they have none).
+
+        Raises:
+            ResultsError: If the member is not registered.
+        """
+        cleaned_name = member_name.strip() if isinstance(member_name, str) else ""
+        if not cleaned_name:
+            raise ResultsError("Member name is required.")
+        if not self._registration.is_registered(cleaned_name):
+            raise ResultsError(f"Crew member '{cleaned_name}' is not registered.")
+        return self._rankings.get(cleaned_name.casefold(), 0)
+
+    def list_rankings(self) -> list[tuple[str, int]]:
+        """Return ``(driver, points)`` pairs sorted by points, then by name."""
+        ranked = [
+            (self._display_names[member_key], points)
+            for member_key, points in self._rankings.items()
+        ]
+        return sorted(ranked, key=lambda item: (-item[1], item[0].casefold()))
+
+    def _normalize_race_key(self, race_id: str) -> str:
+        """Return the case-insensitive lookup key for a race ID."""
+        cleaned = race_id.strip() if isinstance(race_id, str) else ""
+        if not cleaned:
+            raise ResultsError("Race ID is required.")
+        return cleaned.casefold()
+
+    def _calculate_points(self, position: int) -> int:
+        """Return the points awarded for a finishing position."""
+        if position == 1:
+            return 10
+        if position == 2:
+            return 6
+        if position == 3:
+            return 4
+        return 1
